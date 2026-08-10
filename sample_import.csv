@@ -1,0 +1,6 @@
+Date,Item Code,Qty Sold,Sale Price,Notes
+2026-08-10,BRS-5KG,2,75000,Walk-in
+2026-08-10,GLA-1KG,5,16000,Promo
+2026-08-10,UNKNOWN-SKU,1,5000,Error test
+2026-08-10,TLR-1KG,-1,28000,Negative qty test
+2026-08-10,MYK-1L,3,20000,
