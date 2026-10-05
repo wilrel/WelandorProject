@@ -1,27 +1,46 @@
-from pydantic import BaseModel, EmailStr
-from typing import Optional, List
-from datetime import datetime
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from typing import Annotated, Optional, List
+from datetime import datetime, date, timezone
 from models import RoleEnum
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    # SQLite returns naive UTC timestamps; mark them so clients convert to local time correctly.
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+UTCDateTime = Annotated[datetime, AfterValidator(_ensure_utc)]
+
+PAYMENT_METHODS = ("CASH", "QRIS", "TRANSFER", "DEBIT")
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Auth ---
 
 class UserBase(BaseModel):
     email: EmailStr
 
 class UserCreate(UserBase):
-    password: str
+    password: str = Field(min_length=6, max_length=72)
 
-class UserResponse(UserBase):
+class UserResponse(UserBase, ORMModel):
     id: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
+    created_at: UTCDateTime
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
+class RegisterWithWorkspace(UserCreate):
+    workspace_name: str = Field(min_length=2, max_length=100)
+
+
+# --- Workspaces ---
+
 class WorkspaceBase(BaseModel):
-    name: str
+    name: str = Field(min_length=2, max_length=100)
     logo: Optional[str] = None
     address: Optional[str] = None
     phone: Optional[str] = None
@@ -31,121 +50,142 @@ class WorkspaceBase(BaseModel):
 class WorkspaceCreate(WorkspaceBase):
     pass
 
-class WorkspaceResponse(WorkspaceBase):
+class WorkspaceUpdate(WorkspaceBase):
+    pass
+
+class WorkspaceResponse(WorkspaceBase, ORMModel):
     id: int
-    created_at: datetime
+    created_at: UTCDateTime
 
-    class Config:
-        from_attributes = True
+class WorkspaceWithRoleResponse(WorkspaceResponse):
+    role: RoleEnum
 
-# --- Phase 2 Schemas ---
+class MeResponse(UserResponse):
+    workspaces: List[WorkspaceWithRoleResponse] = []
+
+
+# --- Categories & Products ---
 
 class CategoryBase(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100)
 
 class CategoryCreate(CategoryBase):
     pass
 
-class CategoryResponse(CategoryBase):
+class CategoryResponse(CategoryBase, ORMModel):
     id: int
     workspace_id: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
+    created_at: UTCDateTime
 
 class ProductBase(BaseModel):
-    sku: str
-    name: str
-    unit: str
-    selling_price: float
-    current_hpp: float
-    current_stock: int
+    sku: str = Field(min_length=1, max_length=50)
+    name: str = Field(min_length=1, max_length=200)
+    unit: str = Field(min_length=1, max_length=20)
+    selling_price: float = Field(ge=0)
+    current_hpp: float = Field(ge=0)
     is_active: bool = True
     category_id: Optional[int] = None
 
-class ProductCreate(ProductBase):
-    pass
+    @field_validator("sku", "name", "unit")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("tidak boleh kosong")
+        return value
 
-class ProductResponse(ProductBase):
+class ProductCreate(ProductBase):
+    current_stock: int = Field(default=0, ge=0)
+
+class ProductUpdate(ProductBase):
+    """Stock is intentionally not editable here; use purchases or stock adjustments."""
+
+class ProductResponse(ProductBase, ORMModel):
     id: int
     workspace_id: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    current_stock: int
+    created_at: UTCDateTime
+    updated_at: Optional[UTCDateTime] = None
 
-    class Config:
-        from_attributes = True
+
+# --- Transactions ---
 
 class TransactionItemBase(BaseModel):
     product_id: int
-    quantity: int
+    quantity: int = Field(gt=0)
 
 class TransactionItemCreate(TransactionItemBase):
     pass
 
-class TransactionItemResponse(TransactionItemBase):
+class TransactionItemResponse(TransactionItemBase, ORMModel):
     id: int
     selling_price: float
     hpp: float
-
-    class Config:
-        from_attributes = True
+    product_name: Optional[str] = None
+    product_sku: Optional[str] = None
 
 class TransactionBase(BaseModel):
     payment_method: str = "CASH"
 
 class TransactionCreate(TransactionBase):
-    items: List[TransactionItemCreate]
+    items: List[TransactionItemCreate] = Field(min_length=1)
 
-class TransactionResponse(TransactionBase):
+    @field_validator("payment_method")
+    @classmethod
+    def valid_payment_method(cls, value: str) -> str:
+        value = value.upper()
+        if value not in PAYMENT_METHODS:
+            raise ValueError(f"harus salah satu dari: {', '.join(PAYMENT_METHODS)}")
+        return value
+
+class TransactionResponse(TransactionBase, ORMModel):
     id: int
     workspace_id: int
     user_id: int
     total_amount: float
-    timestamp: datetime
+    timestamp: UTCDateTime
     items: List[TransactionItemResponse]
 
-    class Config:
-        from_attributes = True
 
-class InventoryMovementResponse(BaseModel):
+# --- Inventory ---
+
+class InventoryMovementResponse(ORMModel):
     id: int
     workspace_id: int
     product_id: int
+    product_name: Optional[str] = None
+    product_sku: Optional[str] = None
     type: str
     quantity: int
     previous_stock: int
     new_stock: int
     reference_id: Optional[str] = None
     user_id: int
-    timestamp: datetime
+    timestamp: UTCDateTime
 
-    class Config:
-        from_attributes = True
+class InventoryAdjust(BaseModel):
+    actual_stock: int = Field(ge=0)
+    reason: str = Field(default="Stock Opname", max_length=200)
 
-# --- Phase 3 Schemas ---
-class ImportErrorRowResponse(BaseModel):
+
+# --- Imports ---
+
+class ImportErrorRowResponse(ORMModel):
     id: int
     row_number: int
     raw_data: str
     error_message: str
 
-    class Config:
-        from_attributes = True
-
-class ImportJobResponse(BaseModel):
+class ImportJobResponse(ORMModel):
     id: int
     filename: str
     status: str
     total_rows: int
     imported_rows: int
     error_rows: int
-    created_at: datetime
-    completed_at: Optional[datetime] = None
+    created_at: UTCDateTime
+    completed_at: Optional[UTCDateTime] = None
     errors: List[ImportErrorRowResponse] = []
-
-    class Config:
-        from_attributes = True
 
 class ColumnMapping(BaseModel):
     date_col: str
@@ -159,40 +199,67 @@ class UploadPreviewResponse(BaseModel):
     columns: List[str]
     preview_data: List[dict]
 
-# --- Phase 4 Schemas ---
+
+# --- Purchases ---
 
 class PurchaseItemCreate(BaseModel):
     product_id: int
-    quantity: int
-    unit_cost: float
+    quantity: int = Field(gt=0)
+    unit_cost: float = Field(ge=0)
 
 class PurchaseCreate(BaseModel):
-    supplier_name: Optional[str] = None
-    items: List[PurchaseItemCreate]
+    supplier_name: Optional[str] = Field(default=None, max_length=200)
+    items: List[PurchaseItemCreate] = Field(min_length=1)
 
-class PurchaseItemResponse(BaseModel):
+class PurchaseItemResponse(ORMModel):
     id: int
     product_id: int
     quantity: int
     unit_cost: float
-    
-    # Optional nested product
     product: Optional[ProductResponse] = None
 
-    class Config:
-        from_attributes = True
-
-class PurchaseResponse(BaseModel):
+class PurchaseResponse(ORMModel):
     id: int
     workspace_id: int
     supplier_name: Optional[str] = None
     total_amount: float
-    timestamp: datetime
+    timestamp: UTCDateTime
     items: List[PurchaseItemResponse]
 
-    class Config:
-        from_attributes = True
 
-class InventoryAdjust(BaseModel):
-    actual_stock: int
-    reason: str
+# --- Dashboard ---
+
+class DailySales(BaseModel):
+    date: date
+    revenue: float
+    profit: float
+    transactions: int
+
+class TopProduct(BaseModel):
+    product_id: int
+    name: str
+    sku: str
+    quantity: int
+    revenue: float
+
+class LowStockProduct(BaseModel):
+    id: int
+    name: str
+    sku: str
+    unit: str
+    current_stock: int
+
+class DashboardSummary(BaseModel):
+    today_revenue: float
+    today_profit: float
+    today_transactions: int
+    period_revenue: float
+    period_profit: float
+    period_transactions: int
+    average_basket: float
+    inventory_value: float
+    active_products: int
+    low_stock_threshold: int
+    low_stock: List[LowStockProduct]
+    daily_sales: List[DailySales]
+    top_products: List[TopProduct]

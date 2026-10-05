@@ -1,58 +1,184 @@
-import os
-import shutil
-import pandas as pd
 import json
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
-from sqlalchemy.orm import Session
-from typing import List
+import os
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, time
+from typing import List, Optional
+
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.sql import func
 
 import models
 import schemas
+from core.config import settings
+from core.dependencies import get_current_user, get_workspace_member, require_roles, MANAGE_ROLES
+from core.timeutil import get_zone, to_db
 from database import get_db
-from core.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/workspaces/{workspace_id}/imports", tags=["imports"])
 
-TEMP_DIR = "temp_imports"
-os.makedirs(TEMP_DIR, exist_ok=True)
+ALLOWED_EXTENSIONS = (".csv", ".xlsx")
+PREVIEW_ROWS = 5
+
+
+@dataclass
+class AnalyzedRow:
+    index: int
+    raw: dict
+    errors: List[str] = field(default_factory=list)
+    product: Optional[models.Product] = None
+    timestamp: Optional[datetime] = None
+    quantity: int = 0
+    price: float = 0.0
+
+
+def _read_file(path: str, filename: str, nrows: int | None = None) -> pd.DataFrame:
+    # Everything is read as text so SKUs like "00123" keep their leading zeros
+    # and numeric parsing errors can be reported per row.
+    if filename.lower().endswith(".csv"):
+        return pd.read_csv(path, dtype=str, keep_default_na=False, nrows=nrows)
+    return pd.read_excel(path, dtype=str, keep_default_na=False, nrows=nrows)
+
+
+def _parse_number(value: str) -> float:
+    text = str(value).strip().replace(" ", "")
+    if text.lower().startswith("rp"):
+        text = text[2:]
+    if not text:
+        raise ValueError("empty")
+    return float(text)
+
+
+def _get_job(db: Session, workspace_id: int, job_id: int) -> models.ImportJob:
+    job = db.query(models.ImportJob).filter(
+        models.ImportJob.id == job_id,
+        models.ImportJob.workspace_id == workspace_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job import tidak ditemukan")
+    return job
+
+
+def _load_job_file(job: models.ImportJob) -> pd.DataFrame:
+    if not job.temp_file_path or not os.path.exists(job.temp_file_path):
+        raise HTTPException(status_code=400, detail="File import sudah tidak tersedia. Silakan unggah ulang.")
+    try:
+        return _read_file(job.temp_file_path, job.filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Gagal membaca file: {e}")
+
+
+def _analyze(df: pd.DataFrame, mapping: schemas.ColumnMapping, products: dict, zone) -> List[AnalyzedRow]:
+    missing = [col for col in (mapping.date_col, mapping.sku_col, mapping.quantity_col, mapping.price_col) if col not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Kolom tidak ditemukan di file: {', '.join(missing)}")
+
+    # Track stock as rows are consumed so a file cannot oversell a product.
+    remaining_stock = {sku: p.current_stock for sku, p in products.items()}
+    rows: List[AnalyzedRow] = []
+
+    for index, record in df.iterrows():
+        row = AnalyzedRow(index=int(index), raw={str(k): str(v) for k, v in record.items()})
+
+        sku = str(record[mapping.sku_col]).strip()
+        if not sku:
+            row.errors.append("SKU kosong")
+        elif sku not in products:
+            row.errors.append(f"SKU tidak dikenal: {sku}")
+        else:
+            row.product = products[sku]
+
+        try:
+            parsed = pd.to_datetime(str(record[mapping.date_col]).strip())
+            if pd.isna(parsed):
+                raise ValueError
+            # Dates without a time are recorded at midday local time.
+            moment = parsed.to_pydatetime()
+            if moment.tzinfo is None:
+                if moment.time() == time.min:
+                    moment = moment.replace(hour=12)
+                moment = moment.replace(tzinfo=zone)
+            row.timestamp = moment
+        except (ValueError, TypeError, OverflowError):
+            row.errors.append("Format tanggal tidak valid")
+
+        try:
+            qty = _parse_number(record[mapping.quantity_col])
+            if qty <= 0:
+                row.errors.append("Jumlah harus lebih dari 0")
+            elif not float(qty).is_integer():
+                row.errors.append("Jumlah harus bilangan bulat")
+            else:
+                row.quantity = int(qty)
+        except ValueError:
+            row.errors.append("Format jumlah tidak valid")
+
+        try:
+            price = _parse_number(record[mapping.price_col])
+            if price < 0:
+                row.errors.append("Harga tidak boleh negatif")
+            else:
+                row.price = price
+        except ValueError:
+            row.errors.append("Format harga tidak valid")
+
+        if not row.errors and row.product is not None:
+            if remaining_stock[sku] < row.quantity:
+                row.errors.append(f"Stok {row.product.name} tidak mencukupi (tersisa {remaining_stock[sku]})")
+            else:
+                remaining_stock[sku] -= row.quantity
+
+        rows.append(row)
+    return rows
+
+
+def _workspace_products(db: Session, workspace_id: int, lock: bool = False) -> dict:
+    query = db.query(models.Product).filter(
+        models.Product.workspace_id == workspace_id,
+        models.Product.is_active.is_(True),
+    )
+    if lock:
+        query = query.with_for_update()
+    return {p.sku: p for p in query.all()}
+
 
 @router.post("/upload", response_model=schemas.UploadPreviewResponse)
-async def upload_file(workspace_id: int, file: UploadFile = File(...), db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # Verify workspace membership
-    member = db.query(models.WorkspaceMember).filter(
-        models.WorkspaceMember.workspace_id == workspace_id,
-        models.WorkspaceMember.user_id == current_user.id
-    ).first()
-    if not member:
-        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+async def upload_file(
+    workspace_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+    member: models.WorkspaceMember = Depends(require_roles(*MANAGE_ROLES)),
+):
+    filename = os.path.basename(file.filename or "")
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Hanya file CSV dan XLSX yang didukung")
 
-    # Validate extension
-    if not file.filename.endswith(('.csv', '.xlsx')):
-        raise HTTPException(status_code=400, detail="Only CSV and XLSX files are supported")
+    content = await file.read()
+    if len(content) > settings.MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Ukuran file maksimal {settings.MAX_UPLOAD_MB} MB")
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong")
 
-    # Save temp file
-    temp_path = os.path.join(TEMP_DIR, f"{workspace_id}_{current_user.id}_{file.filename}")
+    # Never trust the client filename for the storage path.
+    os.makedirs(settings.TEMP_IMPORT_DIR, exist_ok=True)
+    temp_path = os.path.join(settings.TEMP_IMPORT_DIR, f"{workspace_id}_{uuid.uuid4().hex}{extension}")
     with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
 
-    # Read preview with Pandas
     try:
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(temp_path, nrows=5)
-        else:
-            df = pd.read_excel(temp_path, nrows=5)
+        df = _read_file(temp_path, filename, nrows=PREVIEW_ROWS)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+        os.remove(temp_path)
+        raise HTTPException(status_code=400, detail=f"Gagal membaca file: {e}")
 
-    columns = df.columns.tolist()
-    # Replace NaN with None for JSON serialization
-    preview_data = df.fillna("").to_dict(orient="records")
-
-    # Create Job
     job = models.ImportJob(
         workspace_id=workspace_id,
         user_id=current_user.id,
-        filename=file.filename,
+        filename=filename,
         temp_file_path=temp_path,
         status=models.ImportJobStatus.PENDING
     )
@@ -62,180 +188,132 @@ async def upload_file(workspace_id: int, file: UploadFile = File(...), db: Sessi
 
     return schemas.UploadPreviewResponse(
         job_id=job.id,
-        filename=file.filename,
-        columns=columns,
-        preview_data=preview_data
+        filename=filename,
+        columns=[str(c) for c in df.columns],
+        preview_data=df.to_dict(orient="records"),
     )
 
-@router.post("/{job_id}/validate", response_model=schemas.ImportJobResponse)
-def validate_mapping(workspace_id: int, job_id: int, mapping: schemas.ColumnMapping, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    job = db.query(models.ImportJob).filter(models.ImportJob.id == job_id, models.ImportJob.workspace_id == workspace_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
 
-    job.status = models.ImportJobStatus.VALIDATING
-    db.commit()
+@router.post("/{job_id}/validate", response_model=schemas.ImportJobResponse)
+def validate_mapping(
+    workspace_id: int,
+    job_id: int,
+    mapping: schemas.ColumnMapping,
+    db: Session = Depends(get_db),
+    member: models.WorkspaceMember = Depends(require_roles(*MANAGE_ROLES)),
+):
+    job = _get_job(db, workspace_id, job_id)
+    if job.status in (models.ImportJobStatus.COMPLETED, models.ImportJobStatus.PROCESSING):
+        raise HTTPException(status_code=400, detail="Job import ini sudah diproses")
+
+    df = _load_job_file(job)
+    rows = _analyze(df, mapping, _workspace_products(db, workspace_id), get_zone(member.workspace.timezone))
 
     # Clear previous errors if re-validating
     db.query(models.ImportErrorRow).filter(models.ImportErrorRow.job_id == job.id).delete()
-
-    try:
-        if job.filename.endswith('.csv'):
-            df = pd.read_csv(job.temp_file_path)
-        else:
-            df = pd.read_excel(job.temp_file_path)
-    except Exception as e:
-        job.status = models.ImportJobStatus.FAILED
-        db.commit()
-        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
-
-    total_rows = len(df)
     error_count = 0
-
-    # Fetch valid SKUs for this workspace
-    valid_skus = {p.sku: p.id for p in db.query(models.Product).filter(models.Product.workspace_id == workspace_id).all()}
-
-    # Prepare standard dataframe
-    try:
-        mapped_df = df[[mapping.date_col, mapping.sku_col, mapping.quantity_col, mapping.price_col]].copy()
-    except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Mapped column not found in file: {str(e)}")
-        
-    mapped_df.columns = ['date', 'sku', 'quantity', 'price']
-
-    for index, row in mapped_df.iterrows():
-        errors = []
-        raw_dict = row.to_dict()
-        
-        # Check missing values
-        if pd.isna(row['sku']) or str(row['sku']).strip() == "":
-            errors.append("SKU is missing")
-        elif str(row['sku']).strip() not in valid_skus:
-            errors.append(f"Unknown SKU: {row['sku']}")
-
-        try:
-            qty = float(row['quantity'])
-            if pd.isna(qty) or qty <= 0:
-                errors.append("Quantity must be greater than 0")
-        except ValueError:
-            errors.append("Invalid quantity format")
-
-        try:
-            price = float(row['price'])
-            if pd.isna(price) or price < 0:
-                errors.append("Price must be 0 or greater")
-        except ValueError:
-            errors.append("Invalid price format")
-
-        if errors:
+    for row in rows:
+        if row.errors:
             error_count += 1
-            # Just take the original row for raw data
-            original_row_dict = df.iloc[index].fillna("").to_dict()
-            err_row = models.ImportErrorRow(
+            db.add(models.ImportErrorRow(
                 job_id=job.id,
-                row_number=index + 2, # +1 for header, +1 for 0-index
-                raw_data=json.dumps(original_row_dict),
-                error_message=", ".join(errors)
-            )
-            db.add(err_row)
+                row_number=row.index + 2, # +1 for header, +1 for 0-index
+                raw_data=json.dumps(row.raw, ensure_ascii=False),
+                error_message=", ".join(row.errors),
+            ))
 
-    job.total_rows = total_rows
+    job.total_rows = len(rows)
     job.error_rows = error_count
-    job.status = models.ImportJobStatus.CONFIRMED if error_count < total_rows else models.ImportJobStatus.FAILED
+    valid_rows = len(rows) - error_count
+    job.status = models.ImportJobStatus.CONFIRMED if valid_rows > 0 else models.ImportJobStatus.FAILED
     db.commit()
     db.refresh(job)
-
-    # Return with errors
     return job
 
+
 @router.post("/{job_id}/confirm")
-def confirm_import(workspace_id: int, job_id: int, mapping: schemas.ColumnMapping, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    job = db.query(models.ImportJob).filter(models.ImportJob.id == job_id, models.ImportJob.workspace_id == workspace_id).first()
-    if not job or job.status != models.ImportJobStatus.CONFIRMED:
-        raise HTTPException(status_code=400, detail="Job not ready for confirmation")
+def confirm_import(
+    workspace_id: int,
+    job_id: int,
+    mapping: schemas.ColumnMapping,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+    member: models.WorkspaceMember = Depends(require_roles(*MANAGE_ROLES)),
+):
+    job = _get_job(db, workspace_id, job_id)
+    if job.status != models.ImportJobStatus.CONFIRMED:
+        raise HTTPException(status_code=400, detail="Job belum siap dikonfirmasi. Lakukan validasi terlebih dahulu.")
 
-    job.status = models.ImportJobStatus.PROCESSING
-    db.commit()
-
-    if job.filename.endswith('.csv'):
-        df = pd.read_csv(job.temp_file_path)
-    else:
-        df = pd.read_excel(job.temp_file_path)
-
-    # Get error rows to skip
-    error_rows_q = db.query(models.ImportErrorRow.row_number).filter(models.ImportErrorRow.job_id == job_id).all()
-    error_indices = set([r[0] - 2 for r in error_rows_q])
-
-    valid_products = {p.sku: p for p in db.query(models.Product).filter(models.Product.workspace_id == workspace_id).all()}
+    df = _load_job_file(job)
+    # Re-run the analysis against locked, current stock so the import is consistent
+    # even if sales happened between validation and confirmation.
+    rows = _analyze(df, mapping, _workspace_products(db, workspace_id, lock=True), get_zone(member.workspace.timezone))
 
     imported = 0
-    # Process rows
-    for index, row in df.iterrows():
-        if index in error_indices:
+    for row in rows:
+        if row.errors or row.product is None:
             continue
-            
-        sku_val = str(row[mapping.sku_col]).strip()
-        product = valid_products.get(sku_val)
-        if not product:
-            continue # Should have been caught by validation, but just in case
-            
-        qty = int(float(row[mapping.quantity_col]))
-        price = float(row[mapping.price_col])
+        product = row.product
+        timestamp = to_db(row.timestamp)
 
-        # Create Transaction
         trx = models.Transaction(
             workspace_id=workspace_id,
             user_id=current_user.id,
             payment_method="IMPORT",
-            total_amount=qty * price
+            total_amount=row.quantity * row.price,
+            timestamp=timestamp,
         )
         db.add(trx)
         db.flush() # Get trx ID
 
-        # Create Transaction Item
-        item = models.TransactionItem(
+        db.add(models.TransactionItem(
             transaction_id=trx.id,
             product_id=product.id,
-            quantity=qty,
-            selling_price=price,
+            quantity=row.quantity,
+            selling_price=row.price,
             hpp=product.current_hpp
-        )
-        db.add(item)
-        
-        # Deduct Stock
+        ))
+
         prev_stock = product.current_stock
-        product.current_stock -= qty
-        
-        # Create Movement
-        mov = models.InventoryMovement(
+        product.current_stock -= row.quantity
+
+        db.add(models.InventoryMovement(
             workspace_id=workspace_id,
             product_id=product.id,
             type=models.MovementTypeEnum.SALE,
-            quantity=-qty,
+            quantity=-row.quantity,
             previous_stock=prev_stock,
             new_stock=product.current_stock,
             reference_id=f"IMPORT-{job_id}",
-            user_id=current_user.id
-        )
-        db.add(mov)
-        
+            user_id=current_user.id,
+            timestamp=timestamp,
+        ))
         imported += 1
 
+    job.total_rows = len(rows)
+    job.error_rows = len(rows) - imported
     job.imported_rows = imported
     job.status = models.ImportJobStatus.COMPLETED
-    from sqlalchemy.sql import func
     job.completed_at = func.now()
-    
-    # Cleanup temp file
-    try:
-        os.remove(job.temp_file_path)
-    except:
-        pass
-        
+    temp_path = job.temp_file_path
+    job.temp_file_path = None
     db.commit()
-    return {"message": "Import completed successfully", "imported_rows": imported}
+
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
+
+    return {"message": "Import berhasil", "imported_rows": imported, "skipped_rows": len(rows) - imported}
+
 
 @router.get("", response_model=List[schemas.ImportJobResponse])
-def get_imports(workspace_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    jobs = db.query(models.ImportJob).filter(models.ImportJob.workspace_id == workspace_id).order_by(models.ImportJob.created_at.desc()).all()
-    return jobs
+def get_imports(workspace_id: int, db: Session = Depends(get_db), member: models.WorkspaceMember = Depends(get_workspace_member)):
+    return db.query(models.ImportJob).options(selectinload(models.ImportJob.errors)).filter(
+        models.ImportJob.workspace_id == workspace_id
+    ).order_by(models.ImportJob.created_at.desc(), models.ImportJob.id.desc()).all()
+
+
+@router.get("/{job_id}", response_model=schemas.ImportJobResponse)
+def get_import(workspace_id: int, job_id: int, db: Session = Depends(get_db), member: models.WorkspaceMember = Depends(get_workspace_member)):
+    return _get_job(db, workspace_id, job_id)

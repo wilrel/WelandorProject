@@ -1,14 +1,13 @@
 # WelandorProject
-My Projects
 
-This repository contains all of my projects, both paid and free.  
-It serves as a showcase and archive of my work.
+Kumpulan proyek saya, baik berbayar maupun gratis, sebagai portofolio dan arsip.
 
-## Contents
-- Personal projects
-- Freelance/commercial projects
-- Open-source contributions
+## Proyek
+
+| Proyek | Deskripsi | Teknologi |
+|---|---|---|
+| [TokoBerkah BI](tokoberkahjaya/) | Kasir (POS), manajemen stok, dan dashboard analitik penjualan untuk toko retail / sembako | FastAPI · PostgreSQL · Next.js · Tailwind CSS |
 
 ## Status
-Work in progress — new projects will be added over time.
 
+Aktif dikembangkan; proyek baru akan ditambahkan dari waktu ke waktu.

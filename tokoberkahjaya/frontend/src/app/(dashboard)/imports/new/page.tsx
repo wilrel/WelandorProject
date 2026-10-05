@@ -1,249 +1,246 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { uploadImportFile, validateImportMapping, confirmImport } from '@/lib/api';
-import { Upload, ArrowRight, CheckCircle, AlertTriangle, FileText } from 'lucide-react';
+import Link from 'next/link';
+import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, Download, FileSpreadsheet, Upload } from 'lucide-react';
+import { Button, Card, Field, PageHeader, Select, buttonClass, cx } from '@/components/ui';
+import { useToast } from '@/components/Toast';
+import { confirmImport, getErrorMessage, uploadImportFile, validateImportMapping } from '@/lib/api';
+import { formatNumber } from '@/lib/format';
+import type { ColumnMapping, ImportJob, UploadPreview } from '@/lib/types';
+
+const STEPS = ['Unggah', 'Petakan Kolom', 'Validasi', 'Selesai'];
+
+const FIELDS: { key: keyof ColumnMapping; label: string; hint: string; guesses: string[] }[] = [
+  { key: 'date_col', label: 'Tanggal', hint: 'Format YYYY-MM-DD disarankan', guesses: ['tanggal', 'date', 'tgl', 'waktu'] },
+  { key: 'sku_col', label: 'SKU / Kode Produk', hint: 'Harus sama dengan SKU di menu Produk', guesses: ['sku', 'kode', 'code', 'item'] },
+  { key: 'quantity_col', label: 'Jumlah', hint: 'Bilangan bulat > 0', guesses: ['qty', 'jumlah', 'quantity', 'kuantitas'] },
+  { key: 'price_col', label: 'Harga Jual / Unit', hint: 'Angka tanpa titik ribuan', guesses: ['harga', 'price', 'sale'] },
+];
+
+const TEMPLATE = 'tanggal,sku,jumlah,harga\n2026-08-10,BRS-5KG,2,75000\n2026-08-10,GLA-1KG,5,16000\n';
+
+function guessMapping(columns: string[]): ColumnMapping {
+  const used = new Set<string>();
+  const mapping = { date_col: '', sku_col: '', quantity_col: '', price_col: '' };
+  for (const field of FIELDS) {
+    const match = columns.find((c) => !used.has(c) && field.guesses.some((g) => c.toLowerCase().includes(g)));
+    if (match) {
+      mapping[field.key] = match;
+      used.add(match);
+    }
+  }
+  return mapping;
+}
+
+function downloadTemplate() {
+  const url = URL.createObjectURL(new Blob([TEMPLATE], { type: 'text/csv' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'template-import-penjualan.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export default function NewImportPage() {
-  const router = useRouter();
-  const [step, setStep] = useState(1);
+  const notify = useToast();
+  const [step, setStep] = useState(0);
   const [file, setFile] = useState<File | null>(null);
-  
-  // Job Data
-  const [jobId, setJobId] = useState<number | null>(null);
-  const [columns, setColumns] = useState<string[]>([]);
-  const [previewData, setPreviewData] = useState<any[]>([]);
-  
-  // Validation Data
-  const [validationResult, setValidationResult] = useState<any>(null);
+  const [preview, setPreview] = useState<UploadPreview | null>(null);
+  const [mapping, setMapping] = useState<ColumnMapping>({ date_col: '', sku_col: '', quantity_col: '', price_col: '' });
+  const [validation, setValidation] = useState<ImportJob | null>(null);
+  const [result, setResult] = useState<{ imported_rows: number; skipped_rows: number } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [dragging, setDragging] = useState(false);
 
-  // Mapping
-  const [mapping, setMapping] = useState({
-    date_col: '',
-    sku_col: '',
-    quantity_col: '',
-    price_col: ''
+  const run = async (action: () => Promise<void>) => {
+    setLoading(true);
+    try {
+      await action();
+    } catch (e) {
+      notify(getErrorMessage(e), 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpload = () => run(async () => {
+    if (!file) return;
+    const res = await uploadImportFile(file);
+    setPreview(res);
+    setMapping(guessMapping(res.columns));
+    setStep(1);
   });
 
-  const [loading, setLoading] = useState(false);
+  const mappingComplete = Object.values(mapping).every(Boolean);
+  const duplicateMapping = new Set(Object.values(mapping).filter(Boolean)).size !== Object.values(mapping).filter(Boolean).length;
 
-  const handleUpload = async () => {
-    if (!file) return;
-    setLoading(true);
-    try {
-      const res = await uploadImportFile(file);
-      setJobId(res.job_id);
-      setColumns(res.columns);
-      setPreviewData(res.preview_data);
-      setStep(2);
-    } catch (e: any) {
-      alert("Failed to upload: " + (e.response?.data?.detail || e.message));
-    } finally {
-      setLoading(false);
-    }
+  const handleValidate = () => run(async () => {
+    if (!preview) return;
+    setValidation(await validateImportMapping(preview.job_id, mapping));
+    setStep(2);
+  });
+
+  const handleConfirm = () => run(async () => {
+    if (!preview) return;
+    setResult(await confirmImport(preview.job_id, mapping));
+    setStep(3);
+  });
+
+  const pickFile = (f: File | null | undefined) => {
+    if (!f) return;
+    if (!/\.(csv|xlsx)$/i.test(f.name)) return notify('Hanya file .csv atau .xlsx yang didukung', 'error');
+    setFile(f);
   };
 
-  const handleValidate = async () => {
-    if (!jobId) return;
-    if (!mapping.date_col || !mapping.sku_col || !mapping.quantity_col || !mapping.price_col) {
-      alert("Please map all required columns!");
-      return;
-    }
-    setLoading(true);
-    try {
-      const res = await validateImportMapping(jobId, mapping);
-      setValidationResult(res);
-      setStep(3);
-    } catch (e: any) {
-      alert("Failed to validate: " + (e.response?.data?.detail || e.message));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleConfirm = async () => {
-    if (!jobId) return;
-    setLoading(true);
-    try {
-      await confirmImport(jobId, mapping);
-      setStep(4);
-    } catch (e: any) {
-      alert("Failed to confirm: " + (e.response?.data?.detail || e.message));
-    } finally {
-      setLoading(false);
-    }
-  };
+  const validRows = validation ? validation.total_rows - validation.error_rows : 0;
 
   return (
-    <div className="p-8 max-w-4xl mx-auto">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-900">Import Transaction Data</h1>
-        <div className="flex items-center mt-4">
-          <div className={`text-sm font-medium ${step >= 1 ? 'text-indigo-600' : 'text-gray-400'}`}>1. Upload</div>
-          <div className={`flex-1 h-0.5 mx-4 ${step >= 2 ? 'bg-indigo-600' : 'bg-gray-200'}`}></div>
-          <div className={`text-sm font-medium ${step >= 2 ? 'text-indigo-600' : 'text-gray-400'}`}>2. Map Columns</div>
-          <div className={`flex-1 h-0.5 mx-4 ${step >= 3 ? 'bg-indigo-600' : 'bg-gray-200'}`}></div>
-          <div className={`text-sm font-medium ${step >= 3 ? 'text-indigo-600' : 'text-gray-400'}`}>3. Validate</div>
-          <div className={`flex-1 h-0.5 mx-4 ${step >= 4 ? 'bg-indigo-600' : 'bg-gray-200'}`}></div>
-          <div className={`text-sm font-medium ${step >= 4 ? 'text-indigo-600' : 'text-gray-400'}`}>4. Result</div>
-        </div>
-      </div>
+    <div className="mx-auto max-w-4xl p-4 sm:p-6 lg:p-8">
+      <Link href="/imports" className="mb-4 inline-flex items-center gap-1 text-sm text-slate-500 hover:text-slate-700">
+        <ArrowLeft className="h-4 w-4" /> Kembali ke riwayat import
+      </Link>
+      <PageHeader title="Import Data Penjualan" description="Setiap baris valid dicatat sebagai transaksi dan mengurangi stok." />
 
-      <div className="bg-white rounded-lg shadow border border-gray-200 p-8">
-        {/* Step 1: Upload */}
-        {step === 1 && (
-          <div className="text-center">
-            <Upload className="w-16 h-16 text-indigo-200 mx-auto mb-4" />
-            <h2 className="text-lg font-medium text-gray-900 mb-2">Upload your file</h2>
-            <p className="text-gray-500 text-sm mb-6">Supports .csv or .xlsx files.</p>
-            
-            <input 
-              type="file" 
-              accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-              className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 mb-6 mx-auto max-w-sm"
-            />
-            
-            <button 
-              onClick={handleUpload}
-              disabled={!file || loading}
-              className="bg-indigo-600 text-white px-6 py-2 rounded-md disabled:bg-gray-300 disabled:cursor-not-allowed hover:bg-indigo-700 flex items-center mx-auto"
+      <ol className="mb-6 flex items-center gap-2 text-sm">
+        {STEPS.map((label, i) => (
+          <li key={label} className="flex flex-1 items-center gap-2">
+            <span className={cx('flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-semibold',
+              i < step ? 'bg-indigo-600 text-white' : i === step ? 'border-2 border-indigo-600 text-indigo-600' : 'border border-slate-300 text-slate-400')}>
+              {i < step ? <CheckCircle2 className="h-4 w-4" /> : i + 1}
+            </span>
+            <span className={cx('hidden font-medium sm:inline', i <= step ? 'text-slate-900' : 'text-slate-400')}>{label}</span>
+            {i < STEPS.length - 1 && <span className={cx('h-px flex-1', i < step ? 'bg-indigo-600' : 'bg-slate-200')} />}
+          </li>
+        ))}
+      </ol>
+
+      <Card className="p-6">
+        {step === 0 && (
+          <div className="space-y-6">
+            <label
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={(e) => { e.preventDefault(); setDragging(false); pickFile(e.dataTransfer.files?.[0]); }}
+              className={cx('flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors',
+                dragging ? 'border-indigo-500 bg-indigo-50' : 'border-slate-300 hover:border-indigo-400 hover:bg-slate-50')}
             >
-              {loading ? "Uploading..." : "Continue to Mapping"} <ArrowRight className="w-4 h-4 ml-2" />
-            </button>
+              {file ? <FileSpreadsheet className="mb-3 h-10 w-10 text-indigo-500" /> : <Upload className="mb-3 h-10 w-10 text-slate-400" />}
+              <p className="font-medium text-slate-900">{file ? file.name : 'Klik atau seret file ke sini'}</p>
+              <p className="mt-1 text-sm text-slate-500">{file ? `${(file.size / 1024).toFixed(1)} KB` : 'Format .csv atau .xlsx, maks. 10 MB'}</p>
+              <input type="file" className="sr-only" accept=".csv,.xlsx" onChange={(e) => pickFile(e.target.files?.[0])} />
+            </label>
+            <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <button onClick={downloadTemplate} className="inline-flex items-center gap-1 text-sm font-medium text-indigo-600 hover:text-indigo-700">
+                <Download className="h-4 w-4" /> Unduh template CSV
+              </button>
+              <Button onClick={handleUpload} disabled={!file} loading={loading}>Lanjut ke Pemetaan <ArrowRight className="h-4 w-4" /></Button>
+            </div>
           </div>
         )}
 
-        {/* Step 2: Map Columns */}
-        {step === 2 && (
-          <div>
-            <h2 className="text-lg font-medium text-gray-900 mb-6">Map Columns</h2>
-            <div className="grid grid-cols-2 gap-6 mb-8">
-              {['date', 'sku', 'quantity', 'price'].map((field) => (
-                <div key={field}>
-                  <label className="block text-sm font-medium text-gray-700 mb-1 capitalize">{field} Column <span className="text-red-500">*</span></label>
-                  <select 
-                    className="block w-full border border-gray-300 rounded-md py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 text-sm"
-                    value={(mapping as any)[`${field}_col`]}
-                    onChange={(e) => setMapping({...mapping, [`${field}_col`]: e.target.value})}
-                  >
-                    <option value="">Select column...</option>
-                    {columns.map(col => <option key={col} value={col}>{col}</option>)}
-                  </select>
-                </div>
+        {step === 1 && preview && (
+          <div className="space-y-6">
+            <div>
+              <h2 className="font-semibold text-slate-900">Petakan kolom file</h2>
+              <p className="text-sm text-slate-500">Kolom sudah ditebak otomatis. Periksa kembali sebelum validasi.</p>
+            </div>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              {FIELDS.map((field) => (
+                <Field key={field.key} label={field.label} hint={field.hint} required>
+                  <Select value={mapping[field.key]} onChange={(e) => setMapping({ ...mapping, [field.key]: e.target.value })}>
+                    <option value="">Pilih kolom...</option>
+                    {preview.columns.map((col) => <option key={col} value={col}>{col}</option>)}
+                  </Select>
+                </Field>
               ))}
             </div>
+            {duplicateMapping && <p className="text-sm text-red-600">Satu kolom tidak boleh dipakai untuk dua field.</p>}
 
-            <div className="bg-gray-50 p-4 rounded-lg mb-6 overflow-x-auto">
-              <h3 className="text-sm font-medium text-gray-900 mb-2">File Preview (First 5 Rows)</h3>
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-100">
-                  <tr>
-                    {columns.map(col => <th key={col} className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">{col}</th>)}
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {previewData.map((row, i) => (
-                    <tr key={i}>
-                      {columns.map(col => <td key={col} className="px-3 py-2 whitespace-nowrap text-xs text-gray-500">{row[col]}</td>)}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="flex justify-between">
-              <button onClick={() => setStep(1)} className="text-gray-600 px-4 py-2 hover:bg-gray-100 rounded-md">Back</button>
-              <button 
-                onClick={handleValidate}
-                disabled={loading}
-                className="bg-indigo-600 text-white px-6 py-2 rounded-md hover:bg-indigo-700 disabled:bg-gray-300 flex items-center"
-              >
-                {loading ? "Validating..." : "Validate Data"} <ArrowRight className="w-4 h-4 ml-2" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Step 3: Validate Result */}
-        {step === 3 && validationResult && (
-          <div>
-            <h2 className="text-lg font-medium text-gray-900 mb-6">Validation Result</h2>
-            
-            <div className="grid grid-cols-3 gap-4 mb-6">
-              <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 text-center">
-                <div className="text-2xl font-bold text-gray-900">{validationResult.total_rows}</div>
-                <div className="text-sm text-gray-500">Total Rows</div>
-              </div>
-              <div className="bg-green-50 p-4 rounded-lg border border-green-200 text-center">
-                <div className="text-2xl font-bold text-green-700">{validationResult.total_rows - validationResult.error_rows}</div>
-                <div className="text-sm text-green-600">Valid Rows</div>
-              </div>
-              <div className={`p-4 rounded-lg border text-center ${validationResult.error_rows > 0 ? 'bg-red-50 border-red-200' : 'bg-gray-50 border-gray-200'}`}>
-                <div className={`text-2xl font-bold ${validationResult.error_rows > 0 ? 'text-red-700' : 'text-gray-900'}`}>{validationResult.error_rows}</div>
-                <div className={`text-sm ${validationResult.error_rows > 0 ? 'text-red-600' : 'text-gray-500'}`}>Errors</div>
-              </div>
-            </div>
-
-            {validationResult.errors.length > 0 && (
-              <div className="mb-6 border border-red-200 rounded-lg overflow-hidden">
-                <div className="bg-red-50 px-4 py-3 border-b border-red-200 flex items-center text-red-800 font-medium text-sm">
-                  <AlertTriangle className="w-4 h-4 mr-2" />
-                  Showing {Math.min(validationResult.errors.length, 10)} errors
-                </div>
-                <div className="bg-white max-h-64 overflow-y-auto">
-                  <ul className="divide-y divide-gray-100">
-                    {validationResult.errors.slice(0, 10).map((err: any) => (
-                      <li key={err.id} className="p-4">
-                        <div className="text-sm font-medium text-red-600 mb-1">Row {err.row_number}: {err.error_message}</div>
-                        <div className="text-xs text-gray-500 font-mono bg-gray-50 p-2 rounded">{err.raw_data}</div>
-                      </li>
+            <div className="overflow-hidden rounded-lg border border-slate-200">
+              <p className="border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Pratinjau 5 baris pertama</p>
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-xs">
+                  <thead><tr>{preview.columns.map((c) => <th key={c} className="whitespace-nowrap px-3 py-2 text-left font-medium text-slate-600">{c}</th>)}</tr></thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {preview.preview_data.map((row, i) => (
+                      <tr key={i}>{preview.columns.map((c) => <td key={c} className="whitespace-nowrap px-3 py-2 text-slate-600">{String(row[c] ?? '')}</td>)}</tr>
                     ))}
-                  </ul>
-                </div>
+                  </tbody>
+                </table>
               </div>
-            )}
-
-            {validationResult.error_rows === validationResult.total_rows ? (
-              <div className="text-center p-4 bg-red-50 rounded-lg text-red-700 font-medium mb-6">
-                All rows have errors. You cannot proceed. Please fix your file and try again.
-              </div>
-            ) : (
-              <p className="text-gray-600 text-sm mb-6">
-                {validationResult.error_rows > 0 
-                  ? "Rows with errors will be skipped. Only valid rows will be imported."
-                  : "All rows are valid and ready to be imported."}
-              </p>
-            )}
+            </div>
 
             <div className="flex justify-between">
-              <button onClick={() => setStep(2)} className="text-gray-600 px-4 py-2 hover:bg-gray-100 rounded-md">Back</button>
-              <button 
-                onClick={handleConfirm}
-                disabled={loading || validationResult.error_rows === validationResult.total_rows}
-                className="bg-green-600 text-white px-6 py-2 rounded-md hover:bg-green-700 disabled:bg-gray-300 flex items-center"
-              >
-                {loading ? "Importing..." : "Confirm & Import"} <CheckCircle className="w-4 h-4 ml-2" />
-              </button>
+              <Button variant="ghost" onClick={() => setStep(0)}>Kembali</Button>
+              <Button onClick={handleValidate} disabled={!mappingComplete || duplicateMapping} loading={loading}>Validasi Data <ArrowRight className="h-4 w-4" /></Button>
             </div>
           </div>
         )}
 
-        {/* Step 4: Success */}
-        {step === 4 && (
-          <div className="text-center py-10">
-            <CheckCircle className="w-16 h-16 text-green-500 mx-auto mb-4" />
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">Import Successful!</h2>
-            <p className="text-gray-500 mb-8">Your transactions and inventory have been updated.</p>
-            
-            <div className="flex justify-center space-x-4">
-              <button onClick={() => router.push('/imports')} className="text-indigo-600 bg-indigo-50 px-4 py-2 rounded-md hover:bg-indigo-100 font-medium">View History</button>
-              <button onClick={() => router.push('/products')} className="bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 font-medium">Go to Products</button>
+        {step === 2 && validation && (
+          <div className="space-y-6">
+            <h2 className="font-semibold text-slate-900">Hasil validasi</h2>
+            <div className="grid grid-cols-3 gap-3">
+              <div className="rounded-lg border border-slate-200 p-4 text-center">
+                <p className="text-2xl font-semibold text-slate-900">{formatNumber(validation.total_rows)}</p>
+                <p className="text-sm text-slate-500">Total baris</p>
+              </div>
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center">
+                <p className="text-2xl font-semibold text-emerald-700">{formatNumber(validRows)}</p>
+                <p className="text-sm text-emerald-700">Valid</p>
+              </div>
+              <div className={cx('rounded-lg border p-4 text-center', validation.error_rows ? 'border-red-200 bg-red-50' : 'border-slate-200')}>
+                <p className={cx('text-2xl font-semibold', validation.error_rows ? 'text-red-700' : 'text-slate-900')}>{formatNumber(validation.error_rows)}</p>
+                <p className={cx('text-sm', validation.error_rows ? 'text-red-700' : 'text-slate-500')}>Bermasalah</p>
+              </div>
+            </div>
+
+            {validation.errors.length > 0 && (
+              <div className="overflow-hidden rounded-lg border border-red-200">
+                <p className="flex items-center gap-2 border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-800">
+                  <AlertTriangle className="h-4 w-4" /> Baris bermasalah {validation.errors.length > 50 && '(50 pertama)'}
+                </p>
+                <ul className="max-h-72 divide-y divide-slate-100 overflow-y-auto">
+                  {validation.errors.slice(0, 50).map((err) => (
+                    <li key={err.id} className="px-4 py-3 text-sm">
+                      <p className="font-medium text-red-700">Baris {err.row_number}: {err.error_message}</p>
+                      <p className="mt-1 truncate font-mono text-xs text-slate-500">{err.raw_data}</p>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <p className={cx('rounded-lg px-4 py-3 text-sm', validRows === 0 ? 'bg-red-50 text-red-700' : 'bg-slate-50 text-slate-600')}>
+              {validRows === 0
+                ? 'Tidak ada baris valid. Perbaiki file lalu unggah ulang.'
+                : validation.error_rows > 0
+                  ? `${formatNumber(validRows)} baris valid akan diimpor; baris bermasalah dilewati.`
+                  : 'Semua baris valid dan siap diimpor.'}
+            </p>
+
+            <div className="flex justify-between">
+              <Button variant="ghost" onClick={() => setStep(1)}>Kembali</Button>
+              <Button variant="success" onClick={handleConfirm} disabled={validRows === 0} loading={loading} icon={CheckCircle2}>Konfirmasi & Import</Button>
             </div>
           </div>
         )}
-      </div>
+
+        {step === 3 && result && (
+          <div className="py-8 text-center">
+            <CheckCircle2 className="mx-auto mb-4 h-14 w-14 text-emerald-500" />
+            <h2 className="text-xl font-semibold text-slate-900">Import berhasil</h2>
+            <p className="mt-1 text-slate-500">
+              {formatNumber(result.imported_rows)} transaksi tercatat{result.skipped_rows > 0 && `, ${formatNumber(result.skipped_rows)} baris dilewati`}. Stok telah diperbarui.
+            </p>
+            <div className="mt-6 flex justify-center gap-3">
+              <Link href="/imports" className={buttonClass('secondary')}>Riwayat Import</Link>
+              <Link href="/transactions" className={buttonClass()}>Lihat Transaksi</Link>
+            </div>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }

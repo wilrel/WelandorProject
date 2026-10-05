@@ -1,12 +1,25 @@
+# Dependencies
 node_modules/
+backend/venv/
+backend/.venv/
+
+# Build output
 .next/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local data
 *.sqlite
 *.db
-backend/venv/
-backend/__pycache__/
-backend/.pytest_cache/
-frontend/node_modules/
 backend/temp_imports/
+
+# Environment
 .env
 .env.local
+
+# OS / editor
 .DS_Store
