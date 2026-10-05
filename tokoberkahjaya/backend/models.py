@@ -103,6 +103,14 @@ class TransactionItem(Base):
     transaction = relationship("Transaction", back_populates="items")
     product = relationship("Product")
 
+    @property
+    def product_name(self):
+        return self.product.name if self.product else None
+
+    @property
+    def product_sku(self):
+        return self.product.sku if self.product else None
+
 class MovementTypeEnum(str, enum.Enum):
     OPENING = "OPENING"
     PURCHASE = "PURCHASE"
@@ -126,6 +134,14 @@ class InventoryMovement(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     product = relationship("Product")
+
+    @property
+    def product_name(self):
+        return self.product.name if self.product else None
+
+    @property
+    def product_sku(self):
+        return self.product.sku if self.product else None
 
 class ImportJobStatus(str, enum.Enum):
     PENDING = "PENDING"
