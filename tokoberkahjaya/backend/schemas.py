@@ -1,7 +1,14 @@
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
-from typing import Optional, List
-from datetime import datetime, date
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from typing import Annotated, Optional, List
+from datetime import datetime, date, timezone
 from models import RoleEnum
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    # SQLite returns naive UTC timestamps; mark them so clients convert to local time correctly.
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+UTCDateTime = Annotated[datetime, AfterValidator(_ensure_utc)]
 
 PAYMENT_METHODS = ("CASH", "QRIS", "TRANSFER", "DEBIT")
 
@@ -20,7 +27,7 @@ class UserCreate(UserBase):
 
 class UserResponse(UserBase, ORMModel):
     id: int
-    created_at: datetime
+    created_at: UTCDateTime
 
 class Token(BaseModel):
     access_token: str
@@ -48,7 +55,7 @@ class WorkspaceUpdate(WorkspaceBase):
 
 class WorkspaceResponse(WorkspaceBase, ORMModel):
     id: int
-    created_at: datetime
+    created_at: UTCDateTime
 
 class WorkspaceWithRoleResponse(WorkspaceResponse):
     role: RoleEnum
@@ -68,7 +75,7 @@ class CategoryCreate(CategoryBase):
 class CategoryResponse(CategoryBase, ORMModel):
     id: int
     workspace_id: int
-    created_at: datetime
+    created_at: UTCDateTime
 
 class ProductBase(BaseModel):
     sku: str = Field(min_length=1, max_length=50)
@@ -97,8 +104,8 @@ class ProductResponse(ProductBase, ORMModel):
     id: int
     workspace_id: int
     current_stock: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    created_at: UTCDateTime
+    updated_at: Optional[UTCDateTime] = None
 
 
 # --- Transactions ---
@@ -136,7 +143,7 @@ class TransactionResponse(TransactionBase, ORMModel):
     workspace_id: int
     user_id: int
     total_amount: float
-    timestamp: datetime
+    timestamp: UTCDateTime
     items: List[TransactionItemResponse]
 
 
@@ -154,7 +161,7 @@ class InventoryMovementResponse(ORMModel):
     new_stock: int
     reference_id: Optional[str] = None
     user_id: int
-    timestamp: datetime
+    timestamp: UTCDateTime
 
 class InventoryAdjust(BaseModel):
     actual_stock: int = Field(ge=0)
@@ -176,8 +183,8 @@ class ImportJobResponse(ORMModel):
     total_rows: int
     imported_rows: int
     error_rows: int
-    created_at: datetime
-    completed_at: Optional[datetime] = None
+    created_at: UTCDateTime
+    completed_at: Optional[UTCDateTime] = None
     errors: List[ImportErrorRowResponse] = []
 
 class ColumnMapping(BaseModel):
@@ -216,7 +223,7 @@ class PurchaseResponse(ORMModel):
     workspace_id: int
     supplier_name: Optional[str] = None
     total_amount: float
-    timestamp: datetime
+    timestamp: UTCDateTime
     items: List[PurchaseItemResponse]
 
 

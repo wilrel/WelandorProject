@@ -1,176 +1,209 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { getProducts, adjustInventory, initAuth } from '@/lib/api';
-import { Settings2, X, AlertTriangle } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { AlertTriangle, Banknote, Boxes, History, PackageX, Search, Settings2 } from 'lucide-react';
+import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Spinner, StatCard, Table, Td, Th, cx } from '@/components/ui';
+import { useToast } from '@/components/Toast';
+import { adjustInventory, getErrorMessage, getMovements, getProducts } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
+import { useResource } from '@/lib/useResource';
+import { formatDateTime, formatNumber, formatRupiah } from '@/lib/format';
+import type { InventoryMovement, MovementType, Product } from '@/lib/types';
+
+const MOVEMENT_LABELS: Record<MovementType, { label: string; tone: 'green' | 'red' | 'yellow' | 'blue' | 'gray' }> = {
+  OPENING: { label: 'Stok awal', tone: 'gray' },
+  PURCHASE: { label: 'Pembelian', tone: 'green' },
+  SALE: { label: 'Penjualan', tone: 'blue' },
+  ADJUSTMENT: { label: 'Penyesuaian', tone: 'yellow' },
+  STOCKTAKE: { label: 'Stock opname', tone: 'yellow' },
+};
 
 export default function InventoryPage() {
-  const [products, setProducts] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [adjustingProduct, setAdjustingProduct] = useState<any | null>(null);
-  const [actualStock, setActualStock] = useState<number | ''>('');
+  const { canManage } = useAuth();
+  const notify = useToast();
+  const [tab, setTab] = useState<'stock' | 'history'>('stock');
+  const [search, setSearch] = useState('');
+  const [onlyLow, setOnlyLow] = useState(false);
+  const [historyProduct, setHistoryProduct] = useState('');
+
+  const [adjusting, setAdjusting] = useState<Product | null>(null);
+  const [actualStock, setActualStock] = useState('');
   const [reason, setReason] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    loadProducts();
-  }, []);
+  const onError = (e: unknown) => notify(getErrorMessage(e), 'error');
+  const productsRes = useResource(() => getProducts(), [], onError);
+  const movementsRes = useResource(
+    () => (tab === 'history' ? getMovements(historyProduct ? Number(historyProduct) : undefined) : Promise.resolve(null)),
+    [tab, historyProduct],
+    onError,
+  );
+  const products: Product[] = useMemo(() => productsRes.data ?? [], [productsRes.data]);
+  const movements: InventoryMovement[] = movementsRes.data ?? [];
+  const loading = tab === 'stock' ? productsRes.loading && !productsRes.data : movementsRes.loading;
 
-  async function loadProducts() {
-    setLoading(true);
-    await initAuth();
-    try {
-      const data = await getProducts();
-      setProducts(data);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return products.filter((p) =>
+      (!q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q)) && (!onlyLow || p.current_stock <= 5));
+  }, [products, search, onlyLow]);
 
-  const handleAdjustSubmit = async (e: React.FormEvent) => {
+  const totalValue = products.reduce((s, p) => s + Math.max(p.current_stock, 0) * p.current_hpp, 0);
+  const lowCount = products.filter((p) => p.current_stock <= 5).length;
+
+  const openAdjust = (p: Product) => {
+    setAdjusting(p);
+    setActualStock(String(p.current_stock));
+    setReason('');
+  };
+
+  const diff = adjusting && actualStock !== '' ? Number(actualStock) - adjusting.current_stock : 0;
+
+  const handleAdjust = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!adjustingProduct || actualStock === '') return;
-    if (actualStock === adjustingProduct.current_stock) {
-      alert("Actual stock is same as system stock. No adjustment needed.");
-      return;
-    }
-    
+    if (!adjusting || actualStock === '' || diff === 0) return;
     setSubmitting(true);
     try {
-      await adjustInventory(adjustingProduct.id, {
-        actual_stock: Number(actualStock),
-        reason: reason || 'Stock Opname'
-      });
-      setAdjustingProduct(null);
-      setActualStock('');
-      setReason('');
-      await loadProducts();
-    } catch (e: any) {
-      alert("Failed to adjust inventory: " + (e.response?.data?.detail || e.message));
+      await adjustInventory(adjusting.id, { actual_stock: Number(actualStock), reason: reason.trim() || 'Stock Opname' });
+      notify(`Stok ${adjusting.name} disesuaikan menjadi ${actualStock}`);
+      setAdjusting(null);
+      productsRes.reload();
+      if (tab === 'history') movementsRes.reload();
+    } catch (err) {
+      notify(getErrorMessage(err), 'error');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <div className="p-8 relative">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Inventory & Stock Opname</h1>
-        <p className="text-gray-500 text-sm mt-1">Manage physical stock discrepancies and monitor current asset value.</p>
+    <div className="mx-auto max-w-7xl p-4 sm:p-6 lg:p-8">
+      <PageHeader title="Inventori" description="Pantau stok, nilai persediaan, dan riwayat mutasi barang." />
+
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard icon={Banknote} label="Nilai persediaan" value={formatRupiah(totalValue)} hint="Stok × HPP" />
+        <StatCard icon={Boxes} label="Produk aktif" value={formatNumber(products.length)} />
+        <StatCard icon={PackageX} label="Stok menipis / habis" value={formatNumber(lowCount)} hint="Stok ≤ 5" />
       </div>
 
-      <div className="bg-white rounded-lg shadow border border-gray-200 overflow-hidden">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SKU</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Product Name</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">System Stock</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Current HPP</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Asset Value</th>
-              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Action</th>
-            </tr>
-          </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
-            {loading ? (
-              <tr><td colSpan={6} className="px-6 py-4 text-center text-gray-500">Loading...</td></tr>
-            ) : products.length === 0 ? (
-              <tr><td colSpan={6} className="px-6 py-4 text-center text-gray-500">No products found.</td></tr>
-            ) : (
-              products.map((p) => {
-                const assetValue = p.current_stock * p.current_hpp;
-                return (
-                  <tr key={p.id} className="hover:bg-gray-50">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{p.sku}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.name}</td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`inline-flex px-2.5 py-0.5 rounded-full text-sm font-medium ${p.current_stock <= 5 ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'}`}>
-                        {p.current_stock} {p.unit}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      Rp {p.current_hpp.toLocaleString('id-ID')}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
-                      Rp {assetValue.toLocaleString('id-ID')}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      <button 
-                        onClick={() => { setAdjustingProduct(p); setActualStock(p.current_stock); }}
-                        className="text-indigo-600 hover:text-indigo-900 flex items-center justify-end w-full"
-                      >
-                        <Settings2 className="w-4 h-4 mr-1" /> Adjust
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
+      <div className="mb-4 inline-flex rounded-lg border border-slate-200 bg-white p-0.5 text-sm shadow-sm">
+        {([['stock', 'Stok Produk', Boxes], ['history', 'Riwayat Mutasi', History]] as const).map(([key, label, Icon]) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            className={cx('flex items-center gap-2 rounded-md px-4 py-1.5 font-medium transition-colors', tab === key ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:text-slate-800')}
+          >
+            <Icon className="h-4 w-4" /> {label}
+          </button>
+        ))}
       </div>
 
-      {/* Adjust Modal */}
-      {adjustingProduct && (
-        <div className="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-md overflow-hidden">
-            <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center bg-gray-50">
-              <h3 className="text-lg font-medium text-gray-900">Stock Opname</h3>
-              <button onClick={() => setAdjustingProduct(null)} className="text-gray-400 hover:text-gray-500">
-                <X className="w-5 h-5" />
-              </button>
+      {tab === 'stock' ? (
+        <Card>
+          <div className="flex flex-col gap-3 border-b border-slate-200 p-4 sm:flex-row sm:items-center">
+            <div className="relative flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Input className="pl-9" placeholder="Cari nama atau SKU..." value={search} onChange={(e) => setSearch(e.target.value)} />
             </div>
-            <form onSubmit={handleAdjustSubmit} className="px-6 py-4">
-              <div className="mb-4">
-                <p className="text-sm text-gray-500 mb-1">Product</p>
-                <p className="font-medium text-gray-900">{adjustingProduct.name} ({adjustingProduct.sku})</p>
-              </div>
-              <div className="mb-4">
-                <p className="text-sm text-gray-500 mb-1">System Stock</p>
-                <p className="font-bold text-gray-900">{adjustingProduct.current_stock} {adjustingProduct.unit}</p>
-              </div>
-              <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700 mb-1">Actual Physical Stock</label>
-                <input 
-                  type="number" min="0" required
-                  className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-indigo-500 focus:border-indigo-500"
-                  value={actualStock}
-                  onChange={(e) => setActualStock(e.target.value ? Number(e.target.value) : '')}
-                />
-              </div>
-              
-              {actualStock !== '' && Number(actualStock) !== adjustingProduct.current_stock && (
-                <div className={`mb-4 p-3 rounded-md flex text-sm ${Number(actualStock) < adjustingProduct.current_stock ? 'bg-red-50 text-red-800' : 'bg-yellow-50 text-yellow-800'}`}>
-                  <AlertTriangle className="w-5 h-5 mr-2 flex-shrink-0" />
-                  <p>
-                    Difference: <strong>{Number(actualStock) - adjustingProduct.current_stock} {adjustingProduct.unit}</strong>. 
-                    This will be recorded as an adjustment.
-                  </p>
-                </div>
-              )}
-
-              <div className="mb-6">
-                <label className="block text-sm font-medium text-gray-700 mb-1">Reason (Optional)</label>
-                <input 
-                  type="text" 
-                  placeholder="e.g. Broken, Expired, Stock Opname 2026"
-                  className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-indigo-500 focus:border-indigo-500"
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                />
-              </div>
-              <div className="flex justify-end space-x-3">
-                <button type="button" onClick={() => setAdjustingProduct(null)} className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 bg-white hover:bg-gray-50">Cancel</button>
-                <button type="submit" disabled={submitting || actualStock === '' || Number(actualStock) === adjustingProduct.current_stock} className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 disabled:bg-gray-300">
-                  {submitting ? 'Saving...' : 'Confirm Adjustment'}
-                </button>
-              </div>
-            </form>
+            <label className="flex items-center gap-2 text-sm text-slate-600">
+              <input type="checkbox" className="rounded border-slate-300" checked={onlyLow} onChange={(e) => setOnlyLow(e.target.checked)} />
+              Hanya stok menipis
+            </label>
           </div>
-        </div>
+          {loading ? <Spinner /> : filtered.length === 0 ? (
+            <EmptyState icon={Boxes} title="Tidak ada produk" />
+          ) : (
+            <Table head={
+              <tr>
+                <Th>SKU</Th><Th>Produk</Th><Th align="right">Stok Sistem</Th><Th align="right">HPP</Th><Th align="right">Nilai Persediaan</Th>
+                {canManage && <Th align="right">Aksi</Th>}
+              </tr>
+            }>
+              {filtered.map((p) => (
+                <tr key={p.id} className="hover:bg-slate-50">
+                  <Td className="font-mono text-xs text-slate-500">{p.sku}</Td>
+                  <Td className="font-medium text-slate-900">{p.name}</Td>
+                  <Td align="right">
+                    <Badge tone={p.current_stock <= 0 ? 'red' : p.current_stock <= 5 ? 'yellow' : 'green'}>{formatNumber(p.current_stock)} {p.unit}</Badge>
+                  </Td>
+                  <Td align="right">{formatRupiah(p.current_hpp)}</Td>
+                  <Td align="right" className="font-medium text-slate-900">{formatRupiah(Math.max(p.current_stock, 0) * p.current_hpp)}</Td>
+                  {canManage && (
+                    <Td align="right">
+                      <Button variant="ghost" size="sm" icon={Settings2} onClick={() => openAdjust(p)}>Stock Opname</Button>
+                    </Td>
+                  )}
+                </tr>
+              ))}
+            </Table>
+          )}
+        </Card>
+      ) : (
+        <Card>
+          <div className="border-b border-slate-200 p-4">
+            <Select className="sm:w-72" value={historyProduct} onChange={(e) => setHistoryProduct(e.target.value)} aria-label="Filter produk">
+              <option value="">Semua produk</option>
+              {products.map((p) => <option key={p.id} value={p.id}>{p.sku} — {p.name}</option>)}
+            </Select>
+          </div>
+          {loading ? <Spinner /> : movements.length === 0 ? (
+            <EmptyState icon={History} title="Belum ada mutasi stok" />
+          ) : (
+            <Table head={
+              <tr><Th>Waktu</Th><Th>Produk</Th><Th>Jenis</Th><Th align="right">Perubahan</Th><Th align="right">Stok</Th><Th>Referensi</Th></tr>
+            }>
+              {movements.map((m) => (
+                <tr key={m.id} className="hover:bg-slate-50">
+                  <Td>{formatDateTime(m.timestamp)}</Td>
+                  <Td>
+                    <span className="font-medium text-slate-900">{m.product_name}</span>
+                    <span className="ml-2 font-mono text-xs text-slate-400">{m.product_sku}</span>
+                  </Td>
+                  <Td><Badge tone={MOVEMENT_LABELS[m.type]?.tone ?? 'gray'}>{MOVEMENT_LABELS[m.type]?.label ?? m.type}</Badge></Td>
+                  <Td align="right" className={cx('font-medium', m.quantity > 0 ? 'text-emerald-600' : 'text-red-600')}>
+                    {m.quantity > 0 ? '+' : ''}{formatNumber(m.quantity)}
+                  </Td>
+                  <Td align="right" className="text-slate-500">{formatNumber(m.previous_stock)} → <span className="font-medium text-slate-900">{formatNumber(m.new_stock)}</span></Td>
+                  <Td className="text-slate-500">{m.reference_id ?? '-'}</Td>
+                </tr>
+              ))}
+            </Table>
+          )}
+        </Card>
       )}
+
+      <Modal
+        open={!!adjusting}
+        title="Stock Opname"
+        onClose={() => setAdjusting(null)}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setAdjusting(null)}>Batal</Button>
+            <Button type="submit" form="adjust-form" loading={submitting} disabled={actualStock === '' || diff === 0}>Simpan Penyesuaian</Button>
+          </>
+        }
+      >
+        {adjusting && (
+          <form id="adjust-form" onSubmit={handleAdjust} className="space-y-4">
+            <div className="grid grid-cols-2 gap-4 rounded-lg bg-slate-50 p-3 text-sm">
+              <div><p className="text-slate-500">Produk</p><p className="font-medium text-slate-900">{adjusting.name}</p></div>
+              <div><p className="text-slate-500">Stok sistem</p><p className="font-semibold text-slate-900">{formatNumber(adjusting.current_stock)} {adjusting.unit}</p></div>
+            </div>
+            <Field label="Stok fisik sebenarnya" required>
+              <Input type="number" min={0} required autoFocus value={actualStock} onChange={(e) => setActualStock(e.target.value)} />
+            </Field>
+            {diff !== 0 && (
+              <div className={cx('flex gap-2 rounded-lg p-3 text-sm', diff < 0 ? 'bg-red-50 text-red-800' : 'bg-amber-50 text-amber-800')}>
+                <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                <p>Selisih <strong>{diff > 0 ? '+' : ''}{formatNumber(diff)} {adjusting.unit}</strong> (senilai {formatRupiah(Math.abs(diff) * adjusting.current_hpp)}) akan dicatat sebagai penyesuaian.</p>
+              </div>
+            )}
+            <Field label="Alasan">
+              <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Contoh: Rusak, Kedaluwarsa, Opname bulanan" maxLength={200} />
+            </Field>
+          </form>
+        )}
+      </Modal>
     </div>
   );
 }

@@ -59,6 +59,7 @@ def test_transaction_updates_stock_and_dashboard(client, owner):
     assert body["payment_method"] == "QRIS"
     assert body["items"][0]["quantity"] == 3
     assert body["items"][0]["product_name"] == "Beras 5kg"
+    assert body["timestamp"].endswith(("Z", "+00:00"))
 
     stock = client.get(f"/api/workspaces/{ws}/products/{product['id']}", headers=headers).json()["current_stock"]
     assert stock == 7
